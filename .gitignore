@@ -1,9 +1,9 @@
 # Outputs produced by the notebook
-synthetic_pairs.jsonl
+outputs/
 checkpoints/
-*_lora/
-*_lora_merged/
-poc_outputs.zip
+synthetic_library_*.jsonl
+synthetic_pairs*.jsonl
+embedding_finetune_outputs.zip
 unsloth_compiled_cache/
 
 # Python / Jupyter
