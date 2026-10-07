@@ -18,11 +18,11 @@ The same pipeline is designed to scale up to `Qwen3-Embedding-8B` on larger hard
 | 2 | Configuration | One cell holds every setting you'd change: models, data source, chunk size, training hyper-parameters |
 | 3 | Sample corpus | 16 short docs about **Halyard**, a *fictional* warehouse-robotics product full of invented jargon, plus a 17-term glossary. Because the terms are made up, the base model can't already know them — the same situation as your internal docs |
 | 4 | Load & chunk | Reads documents and splits them into passages of ~80 words |
-| 5 | Synthetic library | `Qwen2.5-3B-Instruct` writes 5 realistic questions per passage (keyword queries, full questions, symptom descriptions). The glossary becomes extra `term → definition` pairs. Everything is cached to `synthetic_pairs.jsonl` so you can review or hand-edit it |
-| 6 | Train/test split | 20% of passages are held out entirely; their questions are only used for evaluation |
+| 5 | Synthetic library | `Qwen2.5-3B-Instruct` writes 8 realistic questions per passage (keyword queries, full questions, symptom descriptions), optionally over several rounds for more variety. The glossary becomes extra pairs, both `term → definition` and `term → the passage that uses it`. Everything is cached to `synthetic_pairs_*.jsonl` so you can review or hand-edit it |
+| 6 | Train/validation/test split | 20% of passages are held out for the final test and 10% for validation (choosing the best epoch); their questions are never trained on |
 | 7 | Baseline | Loads the base embedding model and measures Recall@k, MRR@10 and NDCG@10 |
-| 8 | Hard negatives | For each training question, finds the wrong passage the base model ranks highest, to make training harder and more useful |
-| 9 | Fine-tune | LoRA training with `MultipleNegativesRankingLoss` via Unsloth's `FastSentenceTransformer` |
+| 8 | Hard negatives | For each training question, finds the wrong passage the base model ranks highest (never from the answer's own document), to make training harder and more useful |
+| 9 | Fine-tune | LoRA training with `MultipleNegativesRankingLoss` via Unsloth's `FastSentenceTransformer`. Every epoch is scored on the validation set and the vocabulary; the best epoch is kept and a training curve is drawn |
 | 10 | Re-measure | Same metrics after training, plus the questions whose results improved most |
 | 11 | Vocabulary map | Embeds a set of key terms before and after training and charts how they moved: topic separation scores, a map per topic, each term's margin for finding its own passage, an animated drift plot, and nearest-word associations |
 | 12 | `search()` | A minimal retrieval function to try your own queries |
@@ -78,29 +78,45 @@ ghost slot,storage location recorded as full that is physically empty
 | `BASE_MODEL` | `unsloth/Qwen3-Embedding-0.6B` | Embedding model to fine-tune |
 | `GENERATOR_MODEL` | `Qwen/Qwen2.5-3B-Instruct` | Writes the synthetic questions; fits a T4 |
 | `CHUNK_MAX_WORDS` | 80 | Passage size |
-| `QUERIES_PER_CHUNK` | 5 | Synthetic questions per passage |
-| `TEST_FRACTION` | 0.2 | Share of passages held out for evaluation |
+| `QUERIES_PER_CHUNK` | 8 | Synthetic questions per passage |
+| `QUESTION_ROUNDS` | 1 | Run the generator this many times per passage for extra, more varied questions |
+| `TEST_FRACTION` | 0.2 | Share of passages held out for the final test |
+| `VAL_FRACTION` | 0.1 | Share of passages held out to choose the best epoch |
 | `TASK_INSTRUCTION` | retrieval of documentation passages | Qwen3-Embedding's query instruction; used identically in training and search |
 | `LORA_RANK` | 32 | LoRA rank (alpha set equal) |
-| `EPOCHS` / `BATCH_SIZE` / `LEARNING_RATE` | 4 / 32 / 5e-5 | Training hyper-parameters |
+| `EPOCHS` | 10 | Upper limit; every epoch is scored |
+| `KEEP_BEST_EPOCH` | True | Restore the epoch with the best validation score at the end |
+| `BATCH_SIZE` / `LEARNING_RATE` | 32 / 1e-4 | Training hyper-parameters |
 
 ## How it works
 
 **Synthetic training data.** Real query logs are rarely available, so an instruct LLM reads each passage and writes questions it answers. The prompt asks for a mix of short keyword searches, full questions and symptom-style descriptions, and discourages copying phrases from the passage so the model learns meaning rather than word overlap.
 
-**Honest evaluation.** The split is by *passage*, not by question: test questions point at passages the model never saw as a positive during training, while the search corpus at evaluation time still contains every passage.
+**Honest evaluation.** The split is by *passage*, not by question: test questions point at passages the model never saw as a positive during training, while the search corpus at evaluation time still contains every passage. A separate validation set is used to pick the best epoch, so the final test score isn't flattered by that choice.
 
-**Hard negatives.** The base model ranks all training passages for each question; the highest-scoring *wrong* passage becomes that question's negative. Passages scoring above 95% of the correct one are skipped, since they may also be correct (a false negative). Held-out passages are never used as negatives.
+**Hard negatives.** The base model ranks all training passages for each question; the highest-scoring *wrong* passage becomes that question's negative. Passages from the same document as the answer, and passages scoring above 95% of the correct one, are skipped, since they may also be correct (a false negative). Held-out passages are never used as negatives.
+
+**Glossary in context.** Each glossary term is trained against its one-line definition *and* against the passage that uses it most, so the model learns the term as it appears in your documents.
 
 **Training objective.** `MultipleNegativesRankingLoss` pulls each question towards its passage and away from its hard negative *and* from every other passage in the batch. The query instruction is applied to questions only (via the trainer's `prompts` argument), and a no-duplicates batch sampler keeps the same passage from appearing twice in a batch.
 
 **Metrics.** Each question has one correct passage. *Recall@k* is the share of questions whose correct passage is in the top k; *MRR@10* averages 1/rank; *NDCG@10* averages 1/log2(rank + 1).
 
+## Training longer vs adding data
+
+Section 9 scores the model after every epoch and draws `training_curve.png`: validation MRR@10 and the vocabulary's mean margin per epoch, with epoch 0 as the untrained model.
+
+- **Still rising at the last epoch:** raise `EPOCHS`. Nothing is lost, since the best epoch is kept.
+- **Peaks early, then flat or falling:** the model has learned what the data can teach. More epochs only memorise the training questions; more *varied* data helps instead. Raise `QUERIES_PER_CHUNK` or `QUESTION_ROUNDS`, add documents, add glossary terms, or use a stronger question generator.
+- **Jumpy from epoch to epoch:** lower `LEARNING_RATE` (e.g. `5e-5`).
+
+On the small sample corpus, only a few dozen validation questions decide each point, so expect some noise.
+
 ## Vocabulary map
 
 Section 11 answers *"did training actually change how the model understands our words?"*
 
-**Which terms.** Every glossary term, anything in `VOCAB_EXTRA`, and up to 20 key phrases extracted automatically: two-word phrases and capitalised names (products, roles, screens) that recur in a few documents but aren't spread across all of them. Each term gets a **home passage**, the chunk that uses it most, and a **topic** from `DOC_GROUPS`.
+**Which terms.** Every glossary term, anything in `VOCAB_EXTRA`, and up to 20 key phrases extracted automatically: two-word phrases and capitalised names (products, roles, screens) that recur in a few documents but aren't spread across all of them. Each term gets a **home document**, the one whose passage uses it most, and a **topic** from `DOC_GROUPS`.
 
 **When.** The terms are embedded right after the baseline evaluation (section 7), before any training, and again after training with the same code.
 
@@ -108,9 +124,9 @@ Section 11 answers *"did training actually change how the model understands our 
 
 | Output | What it shows |
 |---|---|
-| Separation table | Computed in the full embedding space: topic silhouette score, mean similarity within and between topics, the gap between the two, and how often each term's home passage ranks #1. A rising gap and silhouette mean terms from the same topic pulled together **and** away from other topics. Within-topic similarity rising on its own isn't enough. |
+| Separation table | Computed in the full embedding space: topic silhouette score, mean similarity within and between topics, the gap between the two, and how often each term's home document ranks #1. A rising gap and silhouette mean terms from the same topic pulled together **and** away from other topics. Within-topic similarity rising on its own isn't enough. |
 | `vocab_map_by_topic.png` | One column per topic, *before* on top and *after* below. The topic's terms are highlighted against all other terms in grey, with the within-topic similarity in each panel. |
-| `term_margins.png` | For each term typed as a search: similarity to its home passage minus the best wrong passage, before and after. Right of zero means the right passage wins. |
+| `term_margins.png` | For each term typed as a search: similarity to its home document minus the best passage from any *other* document, before and after. Right of zero means the right document wins. Other passages from the same document don't count against a term. |
 | `vocab_drift_interactive.html` | Press play to watch every term move from its before to its after position; hover for details. Blue terms find their passage better after training, orange ones worse. |
 | Word associations | Each term's three nearest terms before and after, for the terms that changed most. |
 | `term_metrics.csv` | The per-term numbers behind the charts. |
@@ -124,7 +140,7 @@ Section 11 answers *"did training actually change how the model understands our 
 | `synthetic_pairs.jsonl` | The generated question → passage library (one JSON object per line) |
 | `halyard_embedding_lora/` | LoRA adapter (small; needs the base model to load) |
 | `halyard_embedding_lora_merged/` | Merged 16-bit model, a standard sentence-transformers model |
-| `vocab_maps/` | Vocabulary-map charts, interactive drift plot and per-term metrics |
+| `vocab_maps/` | Training curve, vocabulary-map charts, interactive drift plot and per-term metrics |
 | `poc_outputs.zip` | Adapter, synthetic library and vocabulary maps, downloaded to your computer |
 
 Using the merged model elsewhere:
@@ -151,7 +167,7 @@ The code carries over unchanged (including the vocabulary map); these settings c
 |---|---|---|
 | `BASE_MODEL` | `unsloth/Qwen3-Embedding-0.6B` | `Qwen/Qwen3-Embedding-8B` |
 | `GENERATOR_MODEL` | Qwen2.5-3B-Instruct | a much stronger local model (30–70B) or a hosted API — question quality is the biggest lever |
-| `QUERIES_PER_CHUNK` | 5 | 5–10, across thousands of passages |
+| `QUERIES_PER_CHUNK` | 8 | 8–10, across thousands of passages |
 | `MAX_SEQ_LEN` | 384 | 512–1024 |
 | `BATCH_SIZE` | 32 | 128–512 per GPU; consider `CachedMultipleNegativesRankingLoss` for larger effective batches |
 | `LORA_RANK` | 32 | 32–64 in bf16 (no 4-bit quantisation needed) |
